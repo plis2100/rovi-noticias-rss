@@ -1,567 +1,492 @@
-import os
+import html
 import re
 import sys
+import time
 from datetime import datetime, timezone
-from email.utils import format_datetime, parsedate_to_datetime
+from email.utils import format_datetime
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
-from zoneinfo import ZoneInfo
+from urllib.parse import urljoin, urlsplit, urlunsplit
 import xml.etree.ElementTree as ET
 
 import requests
 from bs4 import BeautifulSoup
 
 
-URL_BASE = "https://www.rovi.es"
-URL_NOTICIAS = "https://www.rovi.es/es/noticias"
-
+URL_PORTADA = "https://www.rovi.es/es/noticias"
+DOMINIO = "https://www.rovi.es"
 ARCHIVO_RSS = Path("rss.xml")
-ZONA_HORARIA = ZoneInfo("Europe/Madrid")
-MAX_ARTICULOS = 3000
+MAXIMO_NOTICIAS = 1000
 
 CABECERAS = {
     "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) "
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/128.0.0.0 Safari/537.36"
+        "Chrome/140.0.0.0 Safari/537.36"
     ),
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;"
         "q=0.9,image/avif,image/webp,*/*;q=0.8"
     ),
-    "Accept-Language": "es-ES,es;q=0.9,en;q=0.7",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.6",
     "Cache-Control": "no-cache",
-    "Referer": URL_BASE + "/",
+}
+
+MESES = {
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "septiembre": 9,
+    "setiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
 }
 
 
-def dentro_del_horario():
-    """
-    Las ejecuciones automáticas funcionan:
-    - De lunes a viernes.
-    - Cada hora.
-    - Desde las 07:00 hasta las 19:59.
-    - Hora peninsular española.
-
-    Las ejecuciones manuales funcionan cualquier día y hora.
-    """
-    evento = os.environ.get("GITHUB_EVENT_NAME", "")
-
-    if evento == "workflow_dispatch":
-        print("Ejecución manual: se ignora el límite horario.")
-        return True
-
-    ahora = datetime.now(ZONA_HORARIA)
-    print(f"Hora española: {ahora:%Y-%m-%d %H:%M:%S %Z}")
-
-    # Monday=0 ... Saturday=5, Sunday=6
-    if ahora.weekday() >= 5:
-        print("Fin de semana: no se actualiza el RSS.")
-        return False
-
-    if not 7 <= ahora.hour <= 19:
-        print("Fuera del horario permitido: 07:00-19:59.")
-        return False
-
-    return True
-
-
-def limpiar_texto(valor):
-    if valor is None:
+def limpiar_texto(texto):
+    if not texto:
         return ""
 
-    return " ".join(str(valor).split()).strip()
+    return re.sub(r"\s+", " ", html.unescape(texto)).strip()
 
 
-def normalizar_url(url):
-    url = limpiar_texto(url)
-
-    if not url:
-        return ""
-
-    return urljoin(URL_BASE, url).split("#")[0]
-
-
-def pertenece_a_rovi(url):
-    try:
-        dominio = urlparse(url).netloc.lower()
-
-        return dominio in ("rovi.es", "www.rovi.es")
-
-    except ValueError:
-        return False
-
-
-def es_enlace_noticia(url):
-    try:
-        if not pertenece_a_rovi(url):
-            return False
-
-        ruta = urlparse(url).path.lower().rstrip("/")
-
-        if not ruta.startswith("/es/noticias/"):
-            return False
-
-        if ruta == "/es/noticias":
-            return False
-
-        extensiones_excluidas = (
-            ".pdf",
-            ".doc",
-            ".docx",
-            ".xls",
-            ".xlsx",
-            ".jpg",
-            ".jpeg",
-            ".png",
+def limpiar_url(url):
+    partes = urlsplit(url)
+    return urlunsplit(
+        (
+            partes.scheme,
+            partes.netloc.lower(),
+            partes.path.rstrip("/"),
+            "",
+            "",
         )
-
-        return not ruta.endswith(extensiones_excluidas)
-
-    except ValueError:
-        return False
+    )
 
 
-def es_documento(url):
-    try:
-        ruta = urlparse(url).path.lower()
-
-        return ruta.endswith(
-            (".pdf", ".doc", ".docx", ".xls", ".xlsx")
-        )
-
-    except ValueError:
-        return False
-
-
-def descargar_pagina():
+def descargar(session, url):
     ultimo_error = None
 
     for intento in range(1, 4):
         try:
-            respuesta = requests.get(
-                URL_NOTICIAS,
+            respuesta = session.get(
+                url,
                 headers=CABECERAS,
-                timeout=45,
+                timeout=35,
                 allow_redirects=True,
             )
             respuesta.raise_for_status()
-
-            if not respuesta.text.strip():
-                raise RuntimeError("La web se descargó vacía.")
+            respuesta.encoding = respuesta.apparent_encoding or "utf-8"
 
             print(
-                f"Página descargada: {len(respuesta.content)} bytes."
+                f"Descargada: {url} "
+                f"({len(respuesta.content)} bytes)"
             )
-
             return respuesta.text
 
-        except Exception as error:
+        except requests.RequestException as error:
             ultimo_error = error
-            print(f"Intento {intento}/3 fallido: {error}")
+            print(
+                f"Intento {intento}/3 fallido para {url}: {error}",
+                file=sys.stderr,
+            )
+            time.sleep(intento * 2)
 
     raise RuntimeError(
-        f"No se pudo descargar la web de ROVI: {ultimo_error}"
+        f"No se pudo descargar {url}: {ultimo_error}"
     )
 
 
-def convertir_fecha(valor):
+def extraer_fecha(texto):
+    texto = limpiar_texto(texto).lower()
+
     coincidencia = re.search(
-        r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b",
-        limpiar_texto(valor),
+        r"\b([0-3]?\d)[/\-.]([01]?\d)[/\-.]((?:19|20)\d{2})\b",
+        texto,
     )
 
     if coincidencia:
         dia, mes, anio = map(int, coincidencia.groups())
 
         try:
-            fecha = datetime(
+            return datetime(
                 anio,
                 mes,
                 dia,
                 12,
                 0,
-                tzinfo=ZONA_HORARIA,
+                tzinfo=timezone.utc,
             )
-
-            return format_datetime(
-                fecha.astimezone(timezone.utc)
-            )
-
         except ValueError:
             pass
 
-    return format_datetime(datetime.now(timezone.utc))
-
-
-def buscar_contenedor(enlace_html):
-    contenedor = enlace_html
-
-    for _ in range(8):
-        if contenedor.parent is None:
-            break
-
-        contenedor = contenedor.parent
-        contenido = contenedor.get_text(" ", strip=True)
-
-        tiene_fecha = bool(
-            re.search(
-                r"\b\d{1,2}/\d{1,2}/\d{4}\b",
-                contenido,
-            )
-        )
-
-        noticias = {
-            normalizar_url(enlace.get("href")).rstrip("/")
-            for enlace in contenedor.find_all("a", href=True)
-            if es_enlace_noticia(
-                normalizar_url(enlace.get("href"))
-            )
-        }
-
-        if tiene_fecha and len(noticias) <= 1:
-            return contenedor
-
-    return enlace_html.parent or enlace_html
-
-
-def obtener_fecha(contenedor):
-    contenido = contenedor.get_text(" ", strip=True)
-
     coincidencia = re.search(
-        r"\b\d{1,2}/\d{1,2}/\d{4}\b",
-        contenido,
+        r"\b([0-3]?\d)\s+de\s+"
+        r"(enero|febrero|marzo|abril|mayo|junio|julio|"
+        r"agosto|septiembre|setiembre|octubre|noviembre|diciembre)"
+        r"\s+de\s+((?:19|20)\d{2})\b",
+        texto,
     )
 
     if coincidencia:
-        return convertir_fecha(coincidencia.group(0))
+        dia = int(coincidencia.group(1))
+        mes = MESES[coincidencia.group(2)]
+        anio = int(coincidencia.group(3))
 
-    return format_datetime(datetime.now(timezone.utc))
+        try:
+            return datetime(
+                anio,
+                mes,
+                dia,
+                12,
+                0,
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            pass
+
+    return None
 
 
-def obtener_titulo(enlace_html, contenedor):
-    titulo = limpiar_texto(
-        enlace_html.get_text(" ", strip=True)
-    )
+def buscar_fecha_en_pagina(soup):
+    selectores = [
+        "meta[property='article:published_time']",
+        "meta[name='date']",
+        "meta[name='publication_date']",
+        "meta[itemprop='datePublished']",
+        "time[datetime]",
+    ]
 
-    genericos = {
-        "descargar",
-        "leer más",
-        "saber más",
-        "ver noticia",
-        "actualidad rovi",
-    }
-
-    if titulo.lower() in genericos:
-        titulo = ""
-
-    if 15 <= len(titulo) <= 500:
-        return titulo
-
-    for selector in (
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        ".title",
-        ".titulo",
-        ".field--name-title",
-    ):
-        elemento = contenedor.select_one(selector)
+    for selector in selectores:
+        elemento = soup.select_one(selector)
 
         if not elemento:
             continue
 
-        titulo = limpiar_texto(
-            elemento.get_text(" ", strip=True)
+        valor = (
+            elemento.get("content")
+            or elemento.get("datetime")
+            or elemento.get_text(" ", strip=True)
         )
 
-        if (
-            15 <= len(titulo) <= 500
-            and titulo.lower() not in genericos
-        ):
-            return titulo
+        if not valor:
+            continue
 
-    return ""
+        try:
+            fecha_iso = valor.strip().replace("Z", "+00:00")
+            fecha = datetime.fromisoformat(fecha_iso)
+
+            if fecha.tzinfo is None:
+                fecha = fecha.replace(tzinfo=timezone.utc)
+
+            return fecha.astimezone(timezone.utc)
+
+        except (ValueError, TypeError):
+            fecha = extraer_fecha(valor)
+
+            if fecha:
+                return fecha
+
+    return extraer_fecha(soup.get_text(" ", strip=True))
 
 
-def obtener_resumen(contenedor, titulo):
-    candidatos = []
+def encontrar_enlaces_noticias(soup):
+    encontrados = {}
 
-    for elemento in contenedor.find_all(
-        ["p", "h2", "h3", "h4"],
-    ):
-        contenido = limpiar_texto(
-            elemento.get_text(" ", strip=True)
+    for enlace in soup.find_all("a", href=True):
+        href = enlace.get("href", "").strip()
+        url = limpiar_url(urljoin(URL_PORTADA, href))
+        texto = limpiar_texto(enlace.get_text(" ", strip=True))
+
+        if not url.startswith(DOMINIO):
+            continue
+
+        # Las noticias de ROVI se publican en /es/content/...
+        if "/es/content/" not in url:
+            continue
+
+        slug = urlsplit(url).path.lower()
+
+        exclusiones = (
+            "/politica-",
+            "/aviso-legal",
+            "/terminos-",
+            "/cookies",
+            "/privacy",
         )
 
-        if not contenido or contenido == titulo:
+        if any(valor in slug for valor in exclusiones):
             continue
 
-        if contenido.lower() in (
-            "descargar",
-            "leer más",
-            "saber más",
-            "ver noticia",
-            "actualidad rovi",
-        ):
-            continue
-
-        if re.fullmatch(
-            r"\d{1,2}/\d{1,2}/\d{4}",
-            contenido,
-        ):
-            continue
-
-        if 30 <= len(contenido) <= 1000:
-            candidatos.append(contenido)
-
-    if candidatos:
-        candidatos.sort(key=len)
-        return candidatos[0]
-
-    return ""
-
-
-def obtener_imagen(contenedor):
-    imagen = contenedor.find("img")
-
-    if not imagen:
-        return ""
-
-    for atributo in (
-        "data-src",
-        "data-lazy-src",
-        "data-original",
-        "src",
-    ):
-        url = normalizar_url(imagen.get(atributo))
-
-        if url and not url.startswith("data:"):
-            return url
-
-    srcset = limpiar_texto(
-        imagen.get("data-srcset")
-        or imagen.get("srcset")
-    )
-
-    if srcset:
-        primera = srcset.split(",")[0].strip().split(" ")[0]
-        return normalizar_url(primera)
-
-    return ""
-
-
-def obtener_documento(contenedor):
-    for enlace_html in contenedor.find_all("a", href=True):
-        url = normalizar_url(enlace_html.get("href"))
-        etiqueta = limpiar_texto(
-            enlace_html.get_text(" ", strip=True)
-        ).lower()
-
-        if es_documento(url):
-            return url
-
-        if "descargar" in etiqueta and url:
-            return url
-
-    return ""
-
-
-def extraer_noticias():
-    html = descargar_pagina()
-    sopa = BeautifulSoup(html, "html.parser")
-
-    articulos = []
-    enlaces_vistos = set()
-
-    for enlace_html in sopa.find_all("a", href=True):
-        enlace = normalizar_url(enlace_html.get("href"))
-
-        if not es_enlace_noticia(enlace):
-            continue
-
-        enlace = enlace.split("?")[0].rstrip("/")
-
-        if enlace in enlaces_vistos:
-            continue
-
-        contenedor = buscar_contenedor(enlace_html)
-        titulo = obtener_titulo(enlace_html, contenedor)
-
-        if not titulo:
-            continue
-
-        fecha = obtener_fecha(contenedor)
-        resumen = obtener_resumen(contenedor, titulo)
-        imagen = obtener_imagen(contenedor)
-        documento = obtener_documento(contenedor)
-
-        descripcion = ""
-
-        if resumen:
-            descripcion += f"<p>{resumen}</p>"
-
-        if documento:
-            descripcion += (
-                f'<p><a href="{documento}">'
-                f"Descargar documento de ROVI"
-                f"</a></p>"
+        if len(texto) < 8:
+            texto = limpiar_texto(
+                enlace.get("title")
+                or enlace.get("aria-label")
+                or ""
             )
 
-        descripcion += (
-            f'<p><a href="{enlace}">'
-            f"Leer la noticia completa en ROVI"
-            f"</a></p>"
-        )
+        if url not in encontrados or len(texto) > len(encontrados[url]):
+            encontrados[url] = texto
 
-        articulos.append(
-            {
-                "title": titulo,
-                "link": enlace,
-                "guid": enlace,
-                "pubDate": fecha,
-                "description": descripcion,
-                "author": "Laboratorios ROVI",
-                "categories": [
-                    "ROVI",
-                    "Noticias corporativas",
-                ],
-                "image": imagen,
-            }
-        )
+    return encontrados
 
-        enlaces_vistos.add(enlace)
 
-    print(
-        f"Noticias únicas encontradas en ROVI: "
-        f"{len(articulos)}"
+def extraer_titulo(soup, titulo_portada, url):
+    titulo = ""
+
+    h1 = soup.select_one("main h1, article h1, h1")
+    if h1:
+        titulo = limpiar_texto(h1.get_text(" ", strip=True))
+
+    if not titulo:
+        meta = soup.select_one("meta[property='og:title']")
+        if meta:
+            titulo = limpiar_texto(meta.get("content", ""))
+
+    if not titulo:
+        titulo = limpiar_texto(titulo_portada)
+
+    if not titulo:
+        slug = urlsplit(url).path.rstrip("/").split("/")[-1]
+        titulo = slug.replace("-", " ").capitalize()
+
+    titulo = re.sub(
+        r"\s*[|–-]\s*Rovi\s*$",
+        "",
+        titulo,
+        flags=re.IGNORECASE,
     )
 
-    return articulos
+    return titulo.strip()
 
 
-def leer_articulos_anteriores():
+def extraer_descripcion(soup):
+    meta = soup.select_one(
+        "meta[property='og:description'], "
+        "meta[name='description']"
+    )
+
+    descripcion_meta = ""
+    if meta:
+        descripcion_meta = limpiar_texto(meta.get("content", ""))
+
+    contenedor = soup.select_one(
+        "main article, "
+        "article, "
+        ".node__content, "
+        ".field--name-body, "
+        ".field-name-body, "
+        "main"
+    )
+
+    fragmentos = []
+
+    if contenedor:
+        for etiqueta in contenedor.select(
+            "script, style, nav, form, button, footer, aside"
+        ):
+            etiqueta.decompose()
+
+        for elemento in contenedor.find_all(["p", "li"]):
+            texto = limpiar_texto(elemento.get_text(" ", strip=True))
+
+            if len(texto) < 35:
+                continue
+
+            if texto in fragmentos:
+                continue
+
+            fragmentos.append(texto)
+
+            if sum(len(x) for x in fragmentos) >= 1800:
+                break
+
+    descripcion = " ".join(fragmentos)
+
+    if len(descripcion) < 60:
+        descripcion = descripcion_meta
+
+    if len(descripcion) > 2500:
+        descripcion = descripcion[:2497].rsplit(" ", 1)[0] + "..."
+
+    return descripcion or "Noticia publicada por ROVI."
+
+
+def extraer_imagen(soup, url):
+    selectores = [
+        "meta[property='og:image']",
+        "meta[name='twitter:image']",
+    ]
+
+    for selector in selectores:
+        elemento = soup.select_one(selector)
+
+        if elemento and elemento.get("content"):
+            imagen = urljoin(url, elemento["content"].strip())
+
+            if imagen.startswith("http"):
+                return imagen
+
+    contenedor = soup.select_one(
+        "main article, article, .node__content, main"
+    )
+
+    if contenedor:
+        imagen = contenedor.find("img", src=True)
+
+        if imagen:
+            return urljoin(url, imagen["src"])
+
+    return ""
+
+
+def extraer_documentos(soup, url):
+    documentos = []
+    vistos = set()
+
+    for enlace in soup.find_all("a", href=True):
+        href = enlace["href"].strip()
+        absoluta = urljoin(url, href)
+        texto = limpiar_texto(enlace.get_text(" ", strip=True))
+
+        es_documento = re.search(
+            r"\.(pdf|doc|docx|xls|xlsx)(?:$|\?)",
+            absoluta,
+            flags=re.IGNORECASE,
+        )
+
+        es_descarga = "descargar" in texto.lower()
+
+        if not es_documento and not es_descarga:
+            continue
+
+        if absoluta in vistos:
+            continue
+
+        vistos.add(absoluta)
+
+        if not texto:
+            texto = "Descargar documento"
+
+        documentos.append(
+            f'<a href="{html.escape(absoluta, quote=True)}">'
+            f"{html.escape(texto)}</a>"
+        )
+
+    return documentos
+
+
+def procesar_noticia(session, url, titulo_portada):
+    try:
+        contenido = descargar(session, url)
+        soup = BeautifulSoup(contenido, "html.parser")
+
+        titulo = extraer_titulo(soup, titulo_portada, url)
+        fecha = buscar_fecha_en_pagina(soup)
+        descripcion = extraer_descripcion(soup)
+        imagen = extraer_imagen(soup, url)
+        documentos = extraer_documentos(soup, url)
+
+        if not fecha:
+            print(
+                f"Descartada por no encontrar fecha: {url}",
+                file=sys.stderr,
+            )
+            return None
+
+        descripcion_html = f"<p>{html.escape(descripcion)}</p>"
+
+        if documentos:
+            descripcion_html += (
+                "<p><strong>Documentos:</strong><br>"
+                + "<br>".join(documentos)
+                + "</p>"
+            )
+
+        if imagen:
+            descripcion_html = (
+                f'<p><img src="{html.escape(imagen, quote=True)}" '
+                f'alt="{html.escape(titulo, quote=True)}"></p>'
+                + descripcion_html
+            )
+
+        return {
+            "titulo": titulo,
+            "url": limpiar_url(url),
+            "fecha": fecha,
+            "descripcion": descripcion_html,
+            "imagen": imagen,
+        }
+
+    except Exception as error:
+        print(
+            f"AVISO: no se pudo procesar {url}: {error}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def leer_rss_anterior():
+    anteriores = {}
+
     if not ARCHIVO_RSS.exists():
-        return []
+        return anteriores
 
     try:
         raiz = ET.parse(ARCHIVO_RSS).getroot()
-    except ET.ParseError:
-        print("El RSS anterior no es válido; se reconstruirá.")
-        return []
+        canal = raiz.find("channel")
 
-    articulos = []
+        if canal is None:
+            return anteriores
 
-    for item in raiz.findall("./channel/item"):
-        categorias = [
-            limpiar_texto(elemento.text)
-            for elemento in item.findall("category")
-            if limpiar_texto(elemento.text)
-        ]
+        for item in canal.findall("item"):
+            enlace = limpiar_url(item.findtext("link", "").strip())
+            titulo = limpiar_texto(item.findtext("title", ""))
+            descripcion = item.findtext("description", "")
+            fecha_texto = item.findtext("pubDate", "")
 
-        enclosure = item.find("enclosure")
-        imagen = ""
+            if not enlace or not titulo:
+                continue
 
-        if enclosure is not None:
-            imagen = limpiar_texto(enclosure.get("url"))
+            try:
+                from email.utils import parsedate_to_datetime
 
-        articulos.append(
-            {
-                "title": limpiar_texto(
-                    item.findtext("title")
-                ),
-                "link": limpiar_texto(
-                    item.findtext("link")
-                ),
-                "guid": limpiar_texto(
-                    item.findtext("guid")
-                ),
-                "pubDate": limpiar_texto(
-                    item.findtext("pubDate")
-                ),
-                "description": limpiar_texto(
-                    item.findtext("description")
-                ),
-                "author": limpiar_texto(
-                    item.findtext("author")
-                ),
-                "categories": categorias,
-                "image": imagen,
+                fecha = parsedate_to_datetime(fecha_texto)
+
+                if fecha.tzinfo is None:
+                    fecha = fecha.replace(tzinfo=timezone.utc)
+
+            except (ValueError, TypeError):
+                fecha = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+            enclosure = item.find("enclosure")
+            imagen = ""
+
+            if enclosure is not None:
+                imagen = enclosure.get("url", "")
+
+            anteriores[enlace] = {
+                "titulo": titulo,
+                "url": enlace,
+                "fecha": fecha,
+                "descripcion": descripcion,
+                "imagen": imagen,
             }
+
+    except (ET.ParseError, OSError) as error:
+        print(
+            f"AVISO: no se pudo leer el RSS anterior: {error}",
+            file=sys.stderr,
         )
 
-    print(
-        f"Noticias recuperadas del RSS anterior: "
-        f"{len(articulos)}"
-    )
-
-    return articulos
+    return anteriores
 
 
-def clave_articulo(articulo):
-    enlace = limpiar_texto(articulo.get("link"))
-
-    if enlace:
-        return enlace.split("?")[0].rstrip("/").lower()
-
-    return limpiar_texto(
-        articulo.get("guid")
-        or articulo.get("title")
-    ).lower()
-
-
-def fecha_ordenacion(articulo):
-    try:
-        fecha = parsedate_to_datetime(
-            articulo["pubDate"]
-        )
-
-        if fecha.tzinfo is None:
-            fecha = fecha.replace(tzinfo=timezone.utc)
-
-        return fecha.timestamp()
-
-    except (
-        TypeError,
-        ValueError,
-        OverflowError,
-        KeyError,
-    ):
-        return 0
-
-
-def combinar_articulos(nuevos, anteriores):
-    nuevos.sort(
-        key=fecha_ordenacion,
-        reverse=True,
-    )
-
-    resultado = []
-    vistos = set()
-
-    for articulo in nuevos + anteriores:
-        clave = clave_articulo(articulo)
-
-        if not clave or clave in vistos:
-            continue
-
-        vistos.add(clave)
-        resultado.append(articulo)
-
-        if len(resultado) >= MAX_ARTICULOS:
-            break
-
-    return resultado
-
-
-def añadir_texto(padre, etiqueta, valor):
-    elemento = ET.SubElement(padre, etiqueta)
-    elemento.text = limpiar_texto(valor)
-    return elemento
-
-
-def crear_rss(articulos):
+def escribir_rss(noticias):
     rss = ET.Element(
         "rss",
         {
@@ -572,159 +497,118 @@ def crear_rss(articulos):
 
     canal = ET.SubElement(rss, "channel")
 
-    añadir_texto(
-        canal,
-        "title",
-        "Laboratorios ROVI — Noticias",
+    ET.SubElement(canal, "title").text = "Actualidad ROVI"
+    ET.SubElement(canal, "link").text = URL_PORTADA
+    ET.SubElement(canal, "description").text = (
+        "Noticias, notas de prensa y actualidad de "
+        "Laboratorios Farmacéuticos ROVI."
     )
-    añadir_texto(
-        canal,
-        "link",
-        URL_NOTICIAS,
+    ET.SubElement(canal, "language").text = "es-ES"
+    ET.SubElement(canal, "lastBuildDate").text = format_datetime(
+        datetime.now(timezone.utc)
     )
-    añadir_texto(
-        canal,
-        "description",
-        (
-            "Noticias, notas de prensa y comunicados "
-            "publicados por Laboratorios ROVI."
-        ),
-    )
-    añadir_texto(canal, "language", "es")
-    añadir_texto(
-        canal,
-        "lastBuildDate",
-        format_datetime(datetime.now(timezone.utc)),
-    )
-    añadir_texto(
-        canal,
-        "generator",
-        "GitHub Actions RSS Generator",
-    )
+    ET.SubElement(canal, "ttl").text = "60"
 
-    atom = ET.SubElement(
+    atom_link = ET.SubElement(
         canal,
         "{http://www.w3.org/2005/Atom}link",
     )
-    atom.set(
+    atom_link.set(
         "href",
-        (
-            "https://raw.githubusercontent.com/"
-            "plis2100/rovi-noticias-rss/main/rss.xml"
-        ),
+        "https://raw.githubusercontent.com/"
+        "plis2100/rovi-noticias-rss/main/rss.xml",
     )
-    atom.set("rel", "self")
-    atom.set("type", "application/rss+xml")
+    atom_link.set("rel", "self")
+    atom_link.set("type", "application/rss+xml")
 
-    for articulo in articulos:
+    for noticia in noticias[:MAXIMO_NOTICIAS]:
         item = ET.SubElement(canal, "item")
 
-        añadir_texto(
-            item,
-            "title",
-            articulo["title"],
+        ET.SubElement(item, "title").text = noticia["titulo"]
+        ET.SubElement(item, "link").text = noticia["url"]
+        ET.SubElement(item, "guid", {"isPermaLink": "true"}).text = (
+            noticia["url"]
         )
-        añadir_texto(
-            item,
-            "link",
-            articulo["link"],
+        ET.SubElement(item, "pubDate").text = format_datetime(
+            noticia["fecha"].astimezone(timezone.utc)
         )
+        ET.SubElement(item, "description").text = noticia["descripcion"]
 
-        guid = añadir_texto(
-            item,
-            "guid",
-            articulo["guid"],
-        )
-        guid.set("isPermaLink", "true")
-
-        añadir_texto(
-            item,
-            "pubDate",
-            articulo["pubDate"],
-        )
-        añadir_texto(
-            item,
-            "description",
-            articulo["description"],
-        )
-        añadir_texto(
-            item,
-            "author",
-            articulo["author"],
-        )
-
-        for categoria in articulo["categories"]:
-            añadir_texto(
-                item,
-                "category",
-                categoria,
-            )
-
-        if articulo["image"]:
-            enclosure = ET.SubElement(
+        if noticia.get("imagen"):
+            ET.SubElement(
                 item,
                 "enclosure",
+                {
+                    "url": noticia["imagen"],
+                    "type": "image/jpeg",
+                },
             )
-            enclosure.set("url", articulo["image"])
-            enclosure.set("type", "image/jpeg")
+
+    ET.indent(rss, space="  ")
 
     arbol = ET.ElementTree(rss)
-    ET.indent(arbol, space="  ")
-
-    temporal = ARCHIVO_RSS.with_suffix(".xml.tmp")
-
     arbol.write(
-        temporal,
+        ARCHIVO_RSS,
         encoding="utf-8",
         xml_declaration=True,
     )
 
-    temporal.replace(ARCHIVO_RSS)
-
 
 def main():
-    if not dentro_del_horario():
-        return
+    session = requests.Session()
 
-    nuevos = extraer_noticias()
-    anteriores = leer_articulos_anteriores()
+    pagina = descargar(session, URL_PORTADA)
+    soup = BeautifulSoup(pagina, "html.parser")
 
-    if not nuevos and not anteriores:
-        raise RuntimeError(
-            "ROVI no devolvió ninguna noticia y tampoco "
-            "existe un RSS anterior."
+    enlaces = encontrar_enlaces_noticias(soup)
+
+    print(f"Enlaces de noticias encontrados en ROVI: {len(enlaces)}")
+
+    nuevas = {}
+
+    for numero, (url, titulo_portada) in enumerate(
+        enlaces.items(),
+        start=1,
+    ):
+        print(f"Procesando {numero}/{len(enlaces)}: {url}")
+
+        noticia = procesar_noticia(
+            session,
+            url,
+            titulo_portada,
         )
 
-    if not nuevos and anteriores:
-        print(
-            "AVISO: no se localizaron noticias nuevas. "
-            "Se conservará el RSS anterior."
-        )
+        if noticia:
+            nuevas[noticia["url"]] = noticia
 
-    articulos = combinar_articulos(
-        nuevos,
-        anteriores,
+        time.sleep(0.25)
+
+    anteriores = leer_rss_anterior()
+
+    # Las noticias nuevas sustituyen a versiones anteriores.
+    todas = dict(anteriores)
+    todas.update(nuevas)
+
+    noticias_ordenadas = sorted(
+        todas.values(),
+        key=lambda noticia: noticia["fecha"],
+        reverse=True,
     )
 
-    if not articulos:
+    print(f"Noticias recuperadas ahora: {len(nuevas)}")
+    print(f"Noticias conservadas del RSS anterior: {len(anteriores)}")
+    print(f"Total de noticias en el RSS: {len(noticias_ordenadas)}")
+
+    if not noticias_ordenadas:
         raise RuntimeError(
-            "No hay artículos para escribir en el RSS."
+            "ROVI no devolvió noticias y tampoco existe "
+            "un RSS anterior."
         )
 
-    crear_rss(articulos)
+    escribir_rss(noticias_ordenadas)
 
-    print(
-        f"RSS creado correctamente con "
-        f"{len(articulos)} noticias."
-    )
+    print("RSS de ROVI generado correctamente.")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as error:
-        print(
-            f"ERROR: {error}",
-            file=sys.stderr,
-        )
-        raise
+    main()
